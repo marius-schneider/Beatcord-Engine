@@ -1,0 +1,14 @@
+# macOS
+.DS_Store
+
+# Secrets — never commit
+.env
+
+# Bun / Node
+node_modules/
+
+# Local dev: engine tool binaries + cache + models (provided per-host)
+bin/
+cache/
+models/
+vendor/
