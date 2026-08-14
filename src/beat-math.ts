@@ -80,7 +80,7 @@ export function transitionStart(grid: BeatGrid, targetSec: number, max: number, 
  * sample-accurately so the bar lands exactly on the outgoing track's bar line.
  */
 export function beatAlignedIntro(grid: BeatGrid | null | undefined, preRollSec = 0.02): number {
-    if (!grid || !grid.beats.length) return 0;
+    if (!grid?.beats.length) return 0;
     const interval = grid.beatInterval;
     if (!(interval > 0)) return 0;
     const b0 = grid.beats[0]!;

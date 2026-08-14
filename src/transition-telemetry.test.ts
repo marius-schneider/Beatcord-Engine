@@ -142,10 +142,21 @@ test("early skip feedback lowers the transition score and is explained", () => {
                 skippedPositionRatio: 0.06,
                 weight: 0.9,
                 source: "skip",
+                attribution: {
+                    trackPreference: 0.1,
+                    transitionPreference: 0.7,
+                    sessionMismatch: 0.15,
+                    repetitionFatigue: 0.05,
+                    confidence: 0.82,
+                    dominant: "transition",
+                    learnTrack: false,
+                    learnTransition: true,
+                },
             },
         }),
     );
     expect(skipped.quality.score).toBeLessThan(clean.quality.score);
     expect(skipped.quality.dimensions.feedback).toBeLessThan(20);
     expect(skipped.quality.notes.join(" ")).toContain("early skip");
+    expect(skipped.quality.notes.join(" ")).toContain("attributed to transition");
 });

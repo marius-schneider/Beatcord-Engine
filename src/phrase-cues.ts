@@ -1,4 +1,5 @@
 import type { BeatGrid } from "./beatgrid";
+import type { TimeRegion } from "./track-profile.types";
 import type { TransitionType } from "./transition-planner";
 
 export type CueGridKind = "phrase" | "bar" | "beat" | "target" | "start";
@@ -15,6 +16,12 @@ export interface TransitionCueOptions {
     lookbackBeats?: number;
     maxPhraseSacrificeBeats?: number;
     maxNextDropDelayBeats?: number;
+    /** Restrict the outgoing cue to the Director-selected musical region. */
+    outgoingRegion?: TimeRegion;
+    /** Restrict the incoming musical entry to the Director-selected region. */
+    incomingRegion?: TimeRegion;
+    /** Power-user quantization request; falls back safely when that grid is unavailable. */
+    alignment?: "beat" | "bar" | "phrase";
 }
 
 export interface TransitionCue {
@@ -124,8 +131,9 @@ function aCandidates(
     maxSec: number,
     preferPhrase: boolean,
     lookbackBeats: number,
+    minSec = 0,
 ): Boundary[] {
-    if (!validGrid(grid)) return [{ sec: clamp(targetSec, 0, maxSec), kind: "target" }];
+    if (!validGrid(grid)) return [{ sec: clamp(targetSec, minSec, maxSec), kind: "target" }];
     const out: Boundary[] = [];
     if (preferPhrase) {
         out.push(...boundariesAtOrBefore(grid, targetSec, maxSec, BEATS_PER_PHRASE, "phrase", lookbackBeats));
@@ -133,7 +141,8 @@ function aCandidates(
     out.push(...boundariesAtOrBefore(grid, targetSec, maxSec, BEATS_PER_BAR, "bar", lookbackBeats));
     out.push(...boundariesAtOrBefore(grid, targetSec, maxSec, 1, "beat", Math.min(lookbackBeats, 8)));
     out.push({ sec: clamp(targetSec, 0, maxSec), kind: "target" });
-    return uniqueBoundaries(out);
+    const bounded = uniqueBoundaries(out).filter((boundary) => boundary.sec >= minSec && boundary.sec <= maxSec);
+    return bounded.length ? bounded : [{ sec: clamp(targetSec, minSec, maxSec), kind: "target" }];
 }
 
 function bCandidates(
@@ -141,9 +150,12 @@ function bCandidates(
     preRollSec: number,
     preferPhrase: boolean,
     maxDropDelayBeats: number,
+    region?: TimeRegion,
 ): Boundary[] {
-    if (!validGrid(grid)) return [{ sec: Math.max(0, preRollSec), kind: "start" }];
-    const from = Math.max(grid.introSec > 1 ? grid.introSec : 0, 0);
+    const regionStart = region ? Math.max(0, region.start) : 0;
+    const regionEnd = region ? Math.max(regionStart, region.end) : Number.POSITIVE_INFINITY;
+    if (!validGrid(grid)) return [{ sec: region ? regionStart : Math.max(0, preRollSec), kind: "start" }];
+    const from = region ? regionStart : Math.max(grid.introSec > 1 ? grid.introSec : 0, 0);
     const out: Boundary[] = [];
     if (preferPhrase) {
         out.push(...boundariesAtOrAfter(grid, from, BEATS_PER_PHRASE, "phrase", maxDropDelayBeats));
@@ -151,7 +163,10 @@ function bCandidates(
     out.push(...boundariesAtOrAfter(grid, from, BEATS_PER_BAR, "bar", maxDropDelayBeats));
     out.push(...boundariesAtOrAfter(grid, from, 1, "beat", Math.min(maxDropDelayBeats, 4)));
     out.push({ sec: from, kind: "target" });
-    return uniqueBoundaries(out);
+    const bounded = uniqueBoundaries(out).filter(
+        (boundary) => boundary.sec >= regionStart && boundary.sec <= regionEnd,
+    );
+    return bounded.length ? bounded : [{ sec: from, kind: "target" }];
 }
 
 function scoreA(
@@ -188,9 +203,10 @@ function scoreB(
     transitionType: TransitionType,
     preferPhrase: boolean,
     maxDropDelayBeats: number,
+    region?: TimeRegion,
 ): number {
     if (!validGrid(grid)) return 12;
-    const from = Math.max(grid.introSec > 1 ? grid.introSec : 0, 0);
+    const from = region ? Math.max(0, region.start) : Math.max(grid.introSec > 1 ? grid.introSec : 0, 0);
     const delayBeats = Math.max(0, (boundary.sec - from) / grid.beatInterval);
     const dropMove = DROP_TRANSITIONS.has(transitionType);
     const kindScore =
@@ -216,19 +232,44 @@ export function chooseTransitionCue(options: TransitionCueOptions): TransitionCu
     const maxPhraseSacrificeBeats = options.maxPhraseSacrificeBeats ?? DEFAULT_MAX_PHRASE_SACRIFICE_BEATS;
     const maxDropDelayBeats = options.maxNextDropDelayBeats ?? DEFAULT_MAX_NEXT_DROP_DELAY_BEATS;
     const detectedEndSec = options.currentGrid?.musicalEndSec;
+    const outgoingStartSec = Math.max(0, options.outgoingRegion?.start ?? 0);
+    const selectedEndSec = options.outgoingRegion?.end;
     const endSec = Math.max(
-        0,
-        detectedEndSec && Number.isFinite(detectedEndSec) && detectedEndSec > 0
-            ? detectedEndSec
-            : options.currentDurationSec,
+        outgoingStartSec,
+        selectedEndSec && Number.isFinite(selectedEndSec) && selectedEndSec > outgoingStartSec
+            ? selectedEndSec
+            : detectedEndSec && Number.isFinite(detectedEndSec) && detectedEndSec > 0
+              ? detectedEndSec
+              : options.currentDurationSec,
     );
-    const targetSec = Math.max(0, endSec - options.fadeSec * rate);
-    const maxSec = Math.max(0, endSec - 0.1);
+    const targetSec = Math.max(outgoingStartSec, endSec - options.fadeSec * rate);
+    const maxSec = Math.max(outgoingStartSec, endSec - 0.1);
     const currentInterval = validGrid(options.currentGrid) ? options.currentGrid.beatInterval : 0.5;
 
     let best: TransitionCue | null = null;
-    for (const a of aCandidates(options.currentGrid, targetSec, maxSec, preferPhrase, lookbackBeats)) {
-        for (const b of bCandidates(options.nextGrid, preRollSec, preferPhrase, maxDropDelayBeats)) {
+    const outgoingCandidates = aCandidates(
+        options.currentGrid,
+        targetSec,
+        maxSec,
+        preferPhrase,
+        lookbackBeats,
+        outgoingStartSec,
+    );
+    const incomingCandidates = bCandidates(
+        options.nextGrid,
+        preRollSec,
+        preferPhrase,
+        maxDropDelayBeats,
+        options.incomingRegion,
+    );
+    const alignedOutgoing = options.alignment
+        ? outgoingCandidates.filter((candidate) => candidate.kind === options.alignment)
+        : outgoingCandidates;
+    const alignedIncoming = options.alignment
+        ? incomingCandidates.filter((candidate) => candidate.kind === options.alignment)
+        : incomingCandidates;
+    for (const a of alignedOutgoing.length ? alignedOutgoing : outgoingCandidates) {
+        for (const b of alignedIncoming.length ? alignedIncoming : incomingCandidates) {
             const aScore = scoreA(
                 a,
                 targetSec,
@@ -239,7 +280,14 @@ export function chooseTransitionCue(options: TransitionCueOptions): TransitionCu
                 preferPhrase,
                 maxPhraseSacrificeBeats,
             );
-            const bScore = scoreB(b, options.nextGrid, options.transitionType, preferPhrase, maxDropDelayBeats);
+            const bScore = scoreB(
+                b,
+                options.nextGrid,
+                options.transitionType,
+                preferPhrase,
+                maxDropDelayBeats,
+                options.incomingRegion,
+            );
             const score = round(50 + aScore + bScore);
             const cue: TransitionCue = {
                 aStartSec: round(a.sec),
@@ -249,7 +297,7 @@ export function chooseTransitionCue(options: TransitionCueOptions): TransitionCu
                 score,
                 aGrid: a.kind,
                 bGrid: b.kind,
-                reason: `${a.kind} out -> ${b.kind} in`,
+                reason: `${a.kind} out -> ${b.kind} in${options.outgoingRegion || options.incomingRegion ? " within selected regions" : ""}`,
             };
             if (!best || cue.score > best.score || (cue.score === best.score && cue.aStartSec > best.aStartSec)) {
                 best = cue;

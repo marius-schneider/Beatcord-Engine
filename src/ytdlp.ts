@@ -5,6 +5,7 @@ import { enforceCacheLimit, touch } from "./cache";
 import { config } from "./config";
 import { createLogger } from "./logger";
 import { isMirrorUrl, mirrorQuery, resolveMirror } from "./mirror";
+import { limitFor, resources } from "./resources";
 import { Semaphore } from "./semaphore";
 import {
     getYtMusicAlbum,
@@ -34,6 +35,30 @@ export interface TrackInfo {
     albumUrl?: string | null;
     /** True for live streams (no finite file to cache — can't be downloaded/mixed). */
     isLive?: boolean;
+    /** Which source this track came from. Absent/"youtube" = yt-dlp; "tidal" = TIDAL. */
+    source?: "youtube" | "tidal";
+    /** Trusted BPM from the source's metadata (TIDAL), when available — used to
+     *  fix beatgrid octave errors. Absent for yt-dlp. */
+    bpm?: number | null;
+    /** Mastering-grade ReplayGain in dB from the source's metadata (TIDAL), when
+     *  available — a gain target that needs no analysis pass. Absent for yt-dlp. */
+    replayGain?: number | null;
+    /** Normalised sample peak (0..1) from the source's metadata, so available
+     *  headroom is `1 - peak`. Pairs with replayGain. Absent for yt-dlp. */
+    peak?: number | null;
+    /** Optional provider identity/album continuity fields used when available. */
+    recordingId?: string | null;
+    isrc?: string | null;
+    fingerprint?: string | null;
+    version?: import("./track-identity").TrackVersion | null;
+    userSelectedVersion?: boolean;
+    albumId?: string | null;
+    discNumber?: number | null;
+    trackNumber?: number | null;
+    continuityGroup?: string | null;
+    gapless?: boolean;
+    originalGapSec?: number | null;
+    conceptAlbum?: boolean;
 }
 
 interface RawEntry {
@@ -404,7 +429,7 @@ function entryPageUrl(e: RawEntry): string {
  * box. Calls past the limit queue and proceed as slots free. Shared by `runYtdlp`
  * and the streaming search spawn so the cap covers all yt-dlp work.
  */
-export const ytdlpSemaphore = new Semaphore(config.YTDLP_MAX_CONCURRENCY);
+export const ytdlpSemaphore = new Semaphore(limitFor(config.YTDLP_MAX_CONCURRENCY, resources.ytdlp));
 
 /** Run yt-dlp (via the resolved fastest command) and return stdout. */
 async function runYtdlp(args: string[]): Promise<string> {

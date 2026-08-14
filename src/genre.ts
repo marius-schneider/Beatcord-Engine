@@ -55,6 +55,10 @@ export interface AudioTraits {
     /** [0,1] beat punchiness from the energy analysis. */
     percussiveness: number;
     bpm: number;
+    /** [0,1] overall energy — a robust discriminator when available (lossless). */
+    energy?: number | undefined;
+    /** [0,3] danceability — high + driving reinforces EDM. */
+    danceability?: number | undefined;
 }
 
 /**
@@ -66,20 +70,24 @@ export interface AudioTraits {
 export function classifyGenreAudio(a: AudioTraits): GenreHint {
     const { centroid, flatness } = a.spectral;
     const perc = a.percussiveness;
+    const energy = a.energy;
+    const dance = a.danceability;
 
-    // Thresholds calibrated on real tracks: percussiveness clusters ~0.25–0.75,
-    // centroid ~1500–4100Hz, flatness ~0.03–0.19.
+    // Chill: low punch is the anchor (works even when energy metadata is flat).
+    // A genuinely low-energy track is chill regardless of a bright timbre.
+    if (perc < 0.3 && centroid < 2900) return "chill";
+    if (energy !== undefined && energy < 0.32 && perc < 0.42) return "chill";
 
-    // Chill: sustained (low punch) AND not bright — lo-fi/ambient/acoustic/ballad.
-    if (perc < 0.3 && centroid < 2800) return "chill";
+    // Hip-hop / trap: strong kick, warm (dark centroid), tonal (low flatness).
+    if (perc >= 0.42 && centroid < 2700 && flatness < 0.09) return "hiphop";
 
-    // Hip-hop / trap: punchy, warm (dark centroid), tonal (low flatness). The
-    // hallmark is a strong kick with little high-frequency air.
-    if (perc >= 0.45 && centroid < 2600 && flatness < 0.08) return "hiphop";
-
-    // EDM / electronic: bright (high centroid) or noisy/synthetic (high flatness),
-    // with a driving beat. Lots of high-frequency energy.
-    if (centroid >= 3000 || flatness >= 0.14) return "edm";
+    // EDM / electronic: bright OR synthetic/noisy, WITH drive. On lossless the
+    // real top end lifts centroid/flatness, so an energy/danceability/punch
+    // "driving" signal is the tie-breaker instead of brightness alone — this is
+    // what keeps FLAC's honest high end from over-labelling everything EDM.
+    const driving = (energy ?? 0.6) >= 0.6 || (dance ?? 1.5) >= 2 || perc >= 0.45;
+    if ((centroid >= 3100 || flatness >= 0.14) && driving) return "edm";
+    if (centroid >= 3400 || flatness >= 0.18) return "edm";
 
     // Pop/rock: the broad middle — mid brightness, some punch.
     if (perc >= 0.3) return "pop";

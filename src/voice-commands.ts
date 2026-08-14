@@ -165,7 +165,7 @@ function stripWakeWord(normText: string, wakeWord: string): string | null {
 
 /** Does `text` begin with `phrase` as whole words? */
 function startsWithPhrase(text: string, phrase: string): boolean {
-    return text === phrase || text.startsWith(phrase + " ");
+    return text === phrase || text.startsWith(`${phrase} `);
 }
 
 /**

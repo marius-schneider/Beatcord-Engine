@@ -1,4 +1,6 @@
+import type { FeedbackAttribution } from "./feedback-attribution";
 import { harmonicScore } from "./key";
+import { assessTempoRelationship } from "./tempo-awareness";
 import type { TransitionType } from "./transition-planner";
 
 export type TransitionExecutionMode = "live" | "offline-render" | "offline-cache" | "fallback";
@@ -11,7 +13,12 @@ export type TransitionFallbackReason =
     | "render-timeout"
     | "render-error"
     | "stale-plan"
-    | "late-handoff";
+    | "late-handoff"
+    | "quality-warning"
+    | "quality-unsafe"
+    | "compute-budget"
+    | "latency-budget"
+    | "audio-validation";
 
 export interface TransitionTrackSnapshot {
     id: string;
@@ -47,6 +54,7 @@ export interface TransitionUserFeedback {
     skippedPositionRatio: number | null;
     weight: number;
     source: "skip";
+    attribution?: FeedbackAttribution;
 }
 
 export interface TransitionTelemetryInput {
@@ -114,10 +122,7 @@ function grade(score: number): TransitionQualityScore["grade"] {
 
 function foldedTempoGapPct(a: number | null, b: number | null): number | null {
     if (!a || !b) return null;
-    let ratio = a / b;
-    if (ratio > 1.4) ratio /= 2;
-    else if (ratio < 0.7) ratio *= 2;
-    return Math.abs(ratio - 1) * 100;
+    return assessTempoRelationship(a, b).effectiveGap * 100;
 }
 
 function timingScore(errorMs: number): number {
@@ -181,7 +186,7 @@ function stretchScore(tempoRatio: number, outgoingTempoRatio: number): number {
 
 function feedbackScore(feedback: TransitionUserFeedback | null | undefined): number {
     if (!feedback) return 100;
-    if (feedback.kind === "early-skip") return clamp(20 - feedback.weight * 20, 0, 20);
+    if (feedback.kind === "early-skip") return clamp(100 - feedback.weight * 100, 0, 100);
     return 72;
 }
 
@@ -222,6 +227,11 @@ function notesFor(record: Omit<TransitionTelemetryRecord, "quality" | "schemaVer
     if (stretch > 0.08) notes.push(`heavy stretch ${(stretch * 100).toFixed(1)}%`);
     if (record.userFeedback?.kind === "early-skip") {
         notes.push(`early skip ${(record.userFeedback.afterTransitionMs / 1000).toFixed(1)}s after transition`);
+        if (record.userFeedback.attribution) {
+            notes.push(
+                `feedback attributed to ${record.userFeedback.attribution.dominant} (${record.userFeedback.attribution.confidence.toFixed(2)})`,
+            );
+        }
     }
     return notes;
 }

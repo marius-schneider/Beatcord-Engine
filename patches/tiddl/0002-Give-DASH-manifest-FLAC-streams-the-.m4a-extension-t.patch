@@ -1,0 +1,41 @@
+From bd2295e5369d9b5af45cf58c6218de84c1e41d39 Mon Sep 17 00:00:00 2001
+From: Marius Schneider <marius.schnd@icloud.com>
+Date: Thu, 13 Aug 2026 14:47:55 +0200
+Subject: [PATCH 2/5] Give DASH-manifest FLAC streams the .m4a extension they
+ actually are
+
+A dash+xml manifest delivers an MP4 container even when codecs say flac, so
+naming the file .flac produced a file no tagger or decoder could read.
+
+Core half of PR #425 (the CLI downloader half is not used here).
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ tiddl/core/utils/parse.py | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/tiddl/core/utils/parse.py b/tiddl/core/utils/parse.py
+index 811dde1..1720b6b 100644
+--- a/tiddl/core/utils/parse.py
++++ b/tiddl/core/utils/parse.py
+@@ -80,12 +80,15 @@ def parse_track_stream(track_stream: TrackStream) -> tuple[list[str], str]:
+ 
+     if codecs == "flac":
+         file_extension = ".flac"
+-        if track_stream.audioQuality == "HI_RES_LOSSLESS":
++        if (
++            track_stream.audioQuality == "HI_RES_LOSSLESS"
++            or track_stream.manifestMimeType == "application/dash+xml"
++        ):
+             file_extension = ".m4a"
+     elif codecs.startswith("mp4") or codecs in DOLBY_CODECS:
+         file_extension = ".m4a"
+     else:
+-        raise ValueError(f"Unknown codecs `{codecs}` (trackId {track_stream.trackId}")
++        raise ValueError(f"Unknown codecs `{codecs}` (trackId {track_stream.trackId})")
+ 
+     return urls, file_extension
+ 
+-- 
+2.55.0
+

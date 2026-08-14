@@ -3,6 +3,7 @@ import { dirname } from "node:path";
 
 import {
     type ResamplerProfile,
+    type RubberbandTuning,
     SAFETY_LIMITER,
     SAMPLE_RATE,
     SOXR_RESAMPLE,
@@ -10,6 +11,11 @@ import {
     type TempoStretcherProfile,
     tempoStretchFilter,
 } from "./constants";
+import {
+    OfflineAudioValidationError,
+    type OfflineAudioValidationResult,
+    validateOfflineAudioFile,
+} from "./offline-audio-validator";
 import type { TransitionType } from "./transition-planner";
 
 export const OFFLINE_TRANSITIONS = ["blend", "fade", "filter", "echo", "bassdrop", "gate", "riser"] as const;
@@ -31,6 +37,8 @@ export interface OfflineTransitionRenderOptions {
     postSec?: number;
     aTempoRatio?: number;
     tempoRatio?: number;
+    aStretchTuning?: RubberbandTuning;
+    bStretchTuning?: RubberbandTuning;
     aInputFilters?: string[];
     bInputFilters?: string[];
     transition?: OfflineTransitionType;
@@ -44,6 +52,8 @@ export interface OfflineTransitionRenderOptions {
     useLadspaTrim?: boolean;
     ladspaAmpPath?: string;
     ladspaTrimGain?: number;
+    /** Decode and inspect the finished artifact before it can enter playback. */
+    validateOutput?: boolean;
 }
 
 export interface OfflineTransitionRenderPlan {
@@ -61,6 +71,7 @@ export interface OfflineTransitionRenderPlan {
 
 export interface OfflineTransitionRenderResult extends OfflineTransitionRenderPlan {
     stderr: string;
+    validation: OfflineAudioValidationResult | null;
 }
 
 interface NormalizedOptions {
@@ -75,6 +86,8 @@ interface NormalizedOptions {
     postSec: number;
     aTempoRatio: number;
     tempoRatio: number;
+    aStretchTuning?: RubberbandTuning;
+    bStretchTuning?: RubberbandTuning;
     aInputFilters: string[];
     bInputFilters: string[];
     transition: OfflineTransitionType;
@@ -118,6 +131,8 @@ function normalizeOptions(options: OfflineTransitionRenderOptions): NormalizedOp
         postSec: numberOr("postSec", options.postSec, 8, 0.25, 120),
         aTempoRatio: numberOr("aTempoRatio", options.aTempoRatio, 1, 0.5, 2),
         tempoRatio: numberOr("tempoRatio", options.tempoRatio, 1, 0.5, 2),
+        ...(options.aStretchTuning ? { aStretchTuning: options.aStretchTuning } : {}),
+        ...(options.bStretchTuning ? { bStretchTuning: options.bStretchTuning } : {}),
         aInputFilters: options.aInputFilters ?? [],
         bInputFilters: options.bInputFilters ?? [],
         transition,
@@ -163,10 +178,11 @@ function sourceChain(
     o: NormalizedOptions,
     tempo = 1,
     inputFilters: string[] = [],
+    stretchTuning?: RubberbandTuning,
 ): string {
     const filters = [
         ...inputFilters,
-        tempoStretchFilter(tempo, o.stretcher),
+        tempoStretchFilter(tempo, o.stretcher, stretchTuning),
         resampleFilter(o.resampler),
         FLOAT_FORMAT,
         `atrim=duration=${sec(duration)}`,
@@ -310,8 +326,8 @@ export function buildOfflineTransitionRender(options: OfflineTransitionRenderOpt
     const aInputDuration = (o.preSec + o.fadeSec) * o.aTempoRatio;
     const bInputDuration = (o.fadeSec + o.postSec) * o.tempoRatio;
     const graph = [
-        sourceChain(0, "a0", o.preSec + o.fadeSec, o, o.aTempoRatio, o.aInputFilters),
-        sourceChain(1, "b0", o.fadeSec + o.postSec, o, o.tempoRatio, o.bInputFilters),
+        sourceChain(0, "a0", o.preSec + o.fadeSec, o, o.aTempoRatio, o.aInputFilters, o.aStretchTuning),
+        sourceChain(1, "b0", o.fadeSec + o.postSec, o, o.tempoRatio, o.bInputFilters, o.bStretchTuning),
     ];
     const transition = transitionGraph(o);
     graph.push(...transition.graph);
@@ -356,5 +372,14 @@ export async function renderOfflineTransition(
     });
     const [stderr, code] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
     if (code !== 0) throw new Error(stderr.trim() || `ffmpeg exited ${code}`);
-    return { ...plan, stderr };
+    const validation =
+        options.validateOutput === false
+            ? null
+            : await validateOfflineAudioFile({
+                  ffmpegPath: plan.ffmpegPath,
+                  filePath: plan.outputPath,
+                  expectedDurationSec: plan.outputDurationSec,
+              });
+    if (validation && !validation.usable) throw new OfflineAudioValidationError(validation);
+    return { ...plan, stderr, validation };
 }

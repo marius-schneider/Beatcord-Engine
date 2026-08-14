@@ -8,6 +8,7 @@ import {
     FRAME_MS,
     PCM_MAX,
     PCM_MIN,
+    type RubberbandTuning,
     SAMPLE_FRAME_BYTES,
     SAMPLE_RATE,
     SAMPLES_PER_FRAME,
@@ -16,6 +17,7 @@ import {
 import { Deck } from "./deck";
 import { bandGains, createBandState, createHpState, highpass, splitBands } from "./eq";
 import { createLogger } from "./logger";
+import { RealtimeQualityGuardian, type RealtimeQualitySnapshot } from "./quality-guardian";
 import type { TransitionType } from "./transition-planner";
 
 const log = createLogger("Mixer");
@@ -49,6 +51,7 @@ export class MixDeck extends Readable {
     #viewB = new Float32Array(this.#scratchB.buffer, this.#scratchB.byteOffset, SAMPLES_PER_FRAME * CHANNELS);
     #viewOut = new Int16Array(this.#out.buffer, this.#out.byteOffset, SAMPLES_PER_FRAME * CHANNELS);
     #floatOut = new Float32Array(SAMPLES_PER_FRAME * CHANNELS);
+    #qualityGuardian = new RealtimeQualityGuardian();
     /** Crossfade progress in frames, and total frames, when fading. */
     #fadeFrame = 0;
     #fadeTotalFrames = 0;
@@ -72,6 +75,11 @@ export class MixDeck extends Readable {
         return (this.#framesPlayed * FRAME_MS) / 1000;
     }
 
+    /** Objective metrics for the current output chain, before final limiting. */
+    get qualitySnapshot(): RealtimeQualitySnapshot {
+        return this.#qualityGuardian.snapshot();
+    }
+
     constructor(events: MixDeckEvents = {}) {
         super({ highWaterMark: DISCORD_FRAME_BYTES * 10 });
         this.#events = events;
@@ -80,6 +88,7 @@ export class MixDeck extends Readable {
     /** Load the first deck and start the paced clock. `loudnorm` = optional gain filter. */
     loadPrimary(filePath: string, startSec = 0, loudnorm?: string): void {
         this.#a?.destroy();
+        this.#qualityGuardian.reset();
         this.#a = new Deck(filePath, startSec, loudnorm ? [loudnorm] : []);
         this.#warmupTicks = 0;
         this.#endRequested = false;
@@ -280,8 +289,14 @@ export class MixDeck extends Readable {
     #prepared: { key: string; deck: Deck } | null = null;
 
     /** Pre-spawn the incoming deck so it's primed when the transition fires. */
-    prepareNext(filePath: string, startSec = 0, tempoRatio = 1, loudnorm?: string): void {
-        const filters = incomingFilters(loudnorm, tempoRatio);
+    prepareNext(
+        filePath: string,
+        startSec = 0,
+        tempoRatio = 1,
+        loudnorm?: string,
+        stretchTuning?: RubberbandTuning,
+    ): void {
+        const filters = incomingFilters(loudnorm, tempoRatio, stretchTuning);
         const key = deckKey(filePath, startSec, filters);
         if (this.#prepared?.key === key) return; // already warming this exact deck
         this.#prepared?.deck.destroy();
@@ -322,6 +337,7 @@ export class MixDeck extends Readable {
         transition: TransitionType = "blend",
         beatSec = 0.5,
         barAtPlaySec?: number,
+        stretchTuning?: RubberbandTuning,
     ): void {
         if (!this.canTransition) return;
         this.#discardRendered();
@@ -329,7 +345,7 @@ export class MixDeck extends Readable {
         // original timeline. The Deck appends the final 48kHz resample afterward.
         // When stretching, the intro offset also stretches: ffmpeg's -ss is applied
         // pre-filter, so the start position stays correct.
-        const filters = incomingFilters(loudnorm, tempoRatio);
+        const filters = incomingFilters(loudnorm, tempoRatio, stretchTuning);
         this.#b = this.#takePrepared(deckKey(filePath, startSec, filters)) ?? new Deck(filePath, startSec, filters);
         // Sample-align the bar lines: the deck starts B_PRE_ROLL_SEC before its bar;
         // trim exactly enough that B's bar lands ON the outgoing track's bar line
@@ -388,9 +404,10 @@ export class MixDeck extends Readable {
         resumeStartSec: number,
         tempoRatio = 1,
         loudnorm?: string,
+        stretchTuning?: RubberbandTuning,
     ): void {
         if (!this.#a || this.#rendered) return;
-        const filters = incomingFilters(loudnorm, tempoRatio);
+        const filters = incomingFilters(loudnorm, tempoRatio, stretchTuning);
         const rendered = new Deck(renderedFilePath, 0, []);
         const pending = new Deck(nextFilePath, resumeStartSec, filters);
         this.#a.destroy();
@@ -601,6 +618,7 @@ export class MixDeck extends Readable {
 
     #tick(): void {
         this.#clock = null;
+        this.#qualityGuardian.noteDeadlineMiss(Date.now() - this.#nextFrameAt);
 
         // Spinback phase: emit the recent output played BACKWARDS with a slowdown,
         // then swap in the pending deck and resume normal playback.
@@ -679,8 +697,10 @@ export class MixDeck extends Readable {
             // (in place, before capturing for spinbacks so the replay matches output).
             if (this.#voiceOver || this.#duck < 1) this.#applyVoiceOver(mix);
             this.#captureRecent(mix); // keep a rolling pre-volume buffer for spinbacks
+            this.#qualityGuardian.observeFloatFrame(mix, this.#gain);
             this.#finalizeFloatFrame(mix, this.#gain, this.#viewOut); // volume + limiter + quantize last
         }
+        if (!mixed) this.#qualityGuardian.noteInsertedSilence(this.#framesPlayed > 0 && !a.drained);
         // The scratch frame is reused next tick, so hand the consumer its own copy.
         // (Silence is immutable and shared, so it can be pushed directly.)
         const ok = this.push(mixed ? Buffer.from(this.#out) : SILENCE_DISCORD_FRAME);
@@ -916,10 +936,10 @@ export function alignTrimSec(playedSec: number, barAtPlaySec: number, preRollSec
 }
 
 /** Pre-resample filter chain for an INCOMING deck (loudness gain, then stretch). */
-function incomingFilters(loudnorm?: string, tempoRatio = 1): string[] {
+function incomingFilters(loudnorm?: string, tempoRatio = 1, stretchTuning?: RubberbandTuning): string[] {
     const filters: string[] = [];
     if (loudnorm) filters.push(loudnorm);
-    const tempoFilter = tempoStretchFilter(tempoRatio);
+    const tempoFilter = tempoStretchFilter(tempoRatio, undefined, stretchTuning);
     if (tempoFilter) filters.push(tempoFilter);
     return filters;
 }

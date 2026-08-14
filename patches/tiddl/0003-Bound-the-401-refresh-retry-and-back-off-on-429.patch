@@ -1,0 +1,83 @@
+From e0d59a245a2d77aa2492cca615282df66a80609d Mon Sep 17 00:00:00 2001
+From: Marius Schneider <marius.schnd@icloud.com>
+Date: Thu, 13 Aug 2026 14:47:55 +0200
+Subject: [PATCH 3/5] Bound the 401 refresh retry and back off on 429
+
+The 401 branch recursed into fetch() unconditionally, so a refresh token the
+server keeps rejecting recursed until RecursionError instead of surfacing a
+clean ApiError. Refresh at most once per fetch.
+
+Adds Retry-After-aware exponential backoff for 429, which fetch() previously
+passed straight through as a hard failure (#262).
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ tiddl/core/api/client.py | 31 +++++++++++++++++++++++++++++--
+ 1 file changed, 29 insertions(+), 2 deletions(-)
+
+diff --git a/tiddl/core/api/client.py b/tiddl/core/api/client.py
+index 8d7620a..75c12f7 100644
+--- a/tiddl/core/api/client.py
++++ b/tiddl/core/api/client.py
+@@ -71,6 +71,7 @@ class TidalClient:
+         params: dict[str, Any] = {},
+         expire_after: int = NEVER_EXPIRE,
+         _attempt: int = 1,
++        _refreshed: bool = False,
+     ) -> T:
+         """
+         Fetch data from the API endpoint
+@@ -81,7 +82,10 @@ class TidalClient:
+             f"{API_URL}/{endpoint}", params=params, expire_after=expire_after
+         )
+ 
+-        if res.status_code == 401 and self.on_token_expiry:
++        if res.status_code == 401 and self.on_token_expiry and not _refreshed:
++            # Refresh at most once per fetch. The previous version recursed
++            # unconditionally, so a refresh token the server keeps rejecting
++            # produced infinite recursion instead of a clean ApiError.
+             token = self.on_token_expiry()
+ 
+             if token:
+@@ -92,7 +96,29 @@ class TidalClient:
+                 endpoint=endpoint,
+                 params=params,
+                 expire_after=expire_after,
+-                _attempt=MAX_RETRIES - 1,
++                _attempt=_attempt,
++                _refreshed=True,
++            )
++
++        if res.status_code == 429 and _attempt < MAX_RETRIES:
++            # TIDAL rate-limits bursts. Honour Retry-After when present, else back
++            # off exponentially; without this the caller just sees a hard failure.
++            retry_after = res.headers.get("Retry-After")
++            try:
++                delay = float(retry_after) if retry_after else RETRY_DELAY * 2 ** (_attempt - 1)
++            except ValueError:
++                delay = RETRY_DELAY * 2 ** (_attempt - 1)
++
++            log.warning(f"rate limited on {endpoint}, retrying in {delay}s ({_attempt}/{MAX_RETRIES})")
++            sleep(delay)
++
++            return self.fetch(
++                model=model,
++                endpoint=endpoint,
++                params=params,
++                expire_after=expire_after,
++                _attempt=_attempt + 1,
++                _refreshed=_refreshed,
+             )
+ 
+         log.debug(
+@@ -119,6 +145,7 @@ class TidalClient:
+                 params=params,
+                 expire_after=expire_after,
+                 _attempt=_attempt + 1,
++                _refreshed=_refreshed,
+             )
+ 
+         if self.debug_path:
+-- 
+2.55.0
+

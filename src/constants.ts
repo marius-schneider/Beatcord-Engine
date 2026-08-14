@@ -45,6 +45,28 @@ export const RESAMPLER_PROFILE: ResamplerProfile = config.FFMPEG_RESAMPLER;
 export type TempoStretcherProfile = "atempo" | "rubberband";
 export const TEMPO_STRETCHER_PROFILE: TempoStretcherProfile = config.FFMPEG_TEMPO_STRETCHER;
 
+export interface RubberbandTuning {
+    transients: "crisp" | "mixed" | "smooth";
+    detector: "compound" | "percussive" | "soft";
+    phase: "laminar" | "independent";
+    window: "standard" | "short" | "long";
+    smoothing: "off" | "on";
+    formant: "shifted" | "preserved";
+    pitchQuality: "quality" | "speed";
+    channels: "apart" | "together";
+}
+
+export const DEFAULT_RUBBERBAND_TUNING: RubberbandTuning = {
+    transients: "crisp",
+    detector: "compound",
+    phase: "laminar",
+    window: "standard",
+    smoothing: "off",
+    formant: "preserved",
+    pitchQuality: "quality",
+    channels: "together",
+};
+
 export const SWR_RESAMPLE = `aresample=${SAMPLE_RATE}:resampler=swr:filter_size=256:async=1:first_pts=0:dither_method=triangular_hp`;
 export const SOXR_RESAMPLE = `aresample=${SAMPLE_RATE}:resampler=soxr:precision=33:cheby=1:async=1:first_pts=0:dither_method=triangular_hp`;
 export const HQ_RESAMPLE = RESAMPLER_PROFILE === "soxr" ? SOXR_RESAMPLE : SWR_RESAMPLE;
@@ -52,6 +74,7 @@ export const HQ_RESAMPLE = RESAMPLER_PROFILE === "soxr" ? SOXR_RESAMPLE : SWR_RE
 export function tempoStretchFilter(
     tempoRatio: number,
     profile: TempoStretcherProfile = TEMPO_STRETCHER_PROFILE,
+    tuning: RubberbandTuning = DEFAULT_RUBBERBAND_TUNING,
 ): string | null {
     if (!Number.isFinite(tempoRatio) || Math.abs(tempoRatio - 1) < 0.0001) return null;
     const tempo = tempoRatio.toFixed(4);
@@ -59,14 +82,14 @@ export function tempoStretchFilter(
         const parts = [
             `rubberband=tempo=${tempo}`,
             "pitch=1",
-            "transients=crisp",
-            "detector=compound",
-            "phase=laminar",
-            "window=standard",
-            "smoothing=off",
-            "formant=preserved",
-            "pitchq=quality",
-            "channels=together",
+            `transients=${tuning.transients}`,
+            `detector=${tuning.detector}`,
+            `phase=${tuning.phase}`,
+            `window=${tuning.window}`,
+            `smoothing=${tuning.smoothing}`,
+            `formant=${tuning.formant}`,
+            `pitchq=${tuning.pitchQuality}`,
+            `channels=${tuning.channels}`,
         ];
         // R3 ("finer") only when explicitly enabled — the option exists only on
         // patched ffmpeg builds; sending it to a stock build errors the filter.

@@ -109,3 +109,24 @@ test("converts the outgoing cue to heard playback time under tempo stretch", () 
     expect(cue.aStartSec).toBe(18);
     expect(cue.aStartPlaySec).toBeCloseTo(18 / 1.05, 3);
 });
+
+test("keeps both cue points inside Director-selected mix regions", () => {
+    const cur = grid(0);
+    cur.musicalEndSec = 180;
+    const cue = chooseTransitionCue({
+        currentGrid: cur,
+        nextGrid: grid(),
+        currentDurationSec: 190,
+        transitionType: "blend",
+        fadeSec: 8,
+        outgoingRegion: { start: 120, end: 144 },
+        incomingRegion: { start: 32, end: 56 },
+        preRollSec: 0.05,
+    });
+
+    expect(cue.aStartSec).toBeGreaterThanOrEqual(120);
+    expect(cue.aStartSec).toBeLessThan(144);
+    expect(cue.bDropSec).toBeGreaterThanOrEqual(32);
+    expect(cue.bDropSec).toBeLessThanOrEqual(56);
+    expect(cue.reason).toContain("selected regions");
+});

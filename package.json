@@ -7,8 +7,12 @@
     ".": "./src/index.ts",
     "./*": "./src/*.ts"
   },
-  "scripts": {
-    "test": "bun test src",
+    "scripts": {
+        "benchmark:golden-mixes": "bun scripts/golden-mix-benchmark.ts",
+        "benchmark:human": "bun scripts/human-benchmark.ts",
+        "benchmark:performance": "bun scripts/performance-audit.ts",
+        "soak:director": "bun scripts/director-soak.ts",
+        "test": "bun test src",
     "typecheck": "tsc --noEmit",
     "lint": "biome check src",
     "format": "biome format --write src",

@@ -54,3 +54,20 @@ export function cleanTrackMeta(rawTitle: string, uploader: string | null): Clean
     if (!t) t = (rawTitle ?? "").trim();
     return { artist, title: t };
 }
+
+/**
+ * Display {artist, title} for a track. Tracks are resolved through catalog APIs
+ * (TIDAL, YouTube Music) that already give clean fields — a real song title and
+ * artist — so the display layer uses them verbatim. No title "cleaning" /
+ * dash-splitting: that only ever existed for raw YouTube video titles like
+ * "Artist - Song (Official Video)".
+ *
+ * The lyrics lookup still cleans titles via {@link cleanTrackMeta}, since LRCLIB
+ * needs the bare song name — that's unrelated to display.
+ */
+export function displayMeta(track: { title: string; uploader: string | null }): {
+    artist: string | null;
+    title: string;
+} {
+    return { artist: track.uploader ?? null, title: track.title };
+}

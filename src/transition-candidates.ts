@@ -1,13 +1,18 @@
-import { classifyGenre, inferGenre } from "./genre";
+import {
+    assessGenreEvidence,
+    type GenreEvidence,
+    type GenreTransitionSignal,
+    genreTransitionSignal,
+} from "./genre-signal";
 import { harmonicScore } from "./key";
 import { isStemQualityUsable } from "./stem-quality";
+import { assessGridTempoRelationship, type TempoRelationshipAssessment } from "./tempo-awareness";
 import {
     type PlannerConfig,
     planTransition,
     type TrackTraits,
     type TransitionPlan,
     type TransitionType,
-    tempoMatchRatio,
 } from "./transition-planner";
 import type { TransitionTelemetryRecord } from "./transition-telemetry";
 import { assessVocalConflict, type VocalConflictScore } from "./vocal-conflict";
@@ -41,6 +46,21 @@ export interface TransitionCandidate {
     musicalScore: number;
     feedbackBias: number;
     reasons: string[];
+    signals: TransitionSignalScores;
+}
+
+export interface TransitionSignalScores {
+    tempo: number;
+    beat: number;
+    downbeat: number;
+    phrase: number;
+    key: number;
+    vocals: number;
+    structure: number;
+    energy: number;
+    genre: number;
+    genreWeight: 0.1;
+    genreContribution: number;
 }
 
 export interface TransitionFeedbackProfileOptions {
@@ -48,17 +68,17 @@ export interface TransitionFeedbackProfileOptions {
 }
 
 interface CandidateContext {
-    curGenre: string;
-    nextGenre: string;
+    currentGenreEvidence: GenreEvidence;
+    nextGenreEvidence: GenreEvidence;
     gap: number;
     tempoRatio: number;
     tempoClose: boolean;
+    tempoRelationship: TempoRelationshipAssessment;
     keyScore: number;
     keyOk: boolean;
     highEnergy: boolean;
     hasOutro: boolean;
-    eitherChill: boolean;
-    eitherHiphop: boolean;
+    incomingIntroSec: number;
     acapellaStemReady: boolean;
     stemQualityScore: number | null;
     vocalDensity: number | null;
@@ -81,14 +101,6 @@ function round(n: number, digits = 1): number {
 
 function clampFade(seconds: number, config: PlannerConfig): number {
     return Math.min(config.maxFadeSec, Math.max(1, seconds));
-}
-
-function foldedTempoGap(curBpm?: number, nextBpm?: number): number {
-    if (!curBpm || !nextBpm) return Infinity;
-    let ratio = curBpm / nextBpm;
-    if (ratio > 1.4) ratio /= 2;
-    else if (ratio < 0.7) ratio *= 2;
-    return Math.abs(ratio - 1);
 }
 
 function tempoBucket(gapPct: number | null): string {
@@ -120,29 +132,26 @@ function stretchBucket(tempoRatio: number, outgoingTempoRatio = 1): string {
 function candidateContext(current: TrackTraits, next: TrackTraits, config: PlannerConfig): CandidateContext {
     const cg = current.grid;
     const ng = next.grid;
-    const curGenre = cg
-        ? classifyGenre(
-              { spectral: cg.spectral, percussiveness: cg.energy.percussiveness, bpm: cg.bpm },
-              current.title,
-              current.uploader,
-          )
-        : inferGenre(current.title, current.uploader);
-    const nextGenre = ng
-        ? classifyGenre(
-              { spectral: ng.spectral, percussiveness: ng.energy.percussiveness, bpm: ng.bpm },
-              next.title,
-              next.uploader,
-          )
-        : inferGenre(next.title, next.uploader);
-    const gap = foldedTempoGap(cg?.bpm, ng?.bpm);
-    const tempoRatio = tempoMatchRatio(cg?.bpm, ng?.bpm, config.tempoTolerance);
+    const genreAudio = (grid: typeof cg) =>
+        grid
+            ? {
+                  spectral: grid.spectral,
+                  percussiveness: grid.energy.percussiveness,
+                  bpm: grid.bpm,
+                  energy: grid.energy.energy,
+                  danceability: grid.energy.danceability,
+              }
+            : null;
+    const currentGenreEvidence = assessGenreEvidence(genreAudio(cg), current.title, current.uploader);
+    const nextGenreEvidence = assessGenreEvidence(genreAudio(ng), next.title, next.uploader);
+    const tempoRelationship = assessGridTempoRelationship(cg, ng, config.tempoTolerance);
+    const gap = tempoRelationship.effectiveGap;
+    const tempoRatio = tempoRelationship.stretchRatio;
     const keyScore = cg && ng ? harmonicScore(cg.key.camelot, ng.key.camelot) : 0;
     const curPunch = cg?.energy.percussiveness ?? 0.3;
     const nextPunch = ng?.energy.percussiveness ?? 0.3;
-    const knownStemQuality = current.stemQuality !== undefined;
     const stemQuality = current.stemQuality ?? null;
-    const acapellaStemReady =
-        !!config.stemsReady && (!knownStemQuality || isStemQualityUsable(stemQuality, config.minStemQuality));
+    const acapellaStemReady = !!config.stemsReady && isStemQualityUsable(stemQuality, config.minStemQuality);
     const vocalConflict = assessVocalConflict({
         outgoingStemQuality: stemQuality,
         incomingStemQuality: next.stemQuality,
@@ -154,17 +163,17 @@ function candidateContext(current: TrackTraits, next: TrackTraits, config: Plann
         maxRisk: config.vocalConflictMaxRisk,
     });
     return {
-        curGenre,
-        nextGenre,
+        currentGenreEvidence,
+        nextGenreEvidence,
         gap,
         tempoRatio,
-        tempoClose: gap <= config.tempoTolerance || tempoRatio !== 1,
+        tempoClose: tempoRelationship.compatible,
+        tempoRelationship,
         keyScore,
         keyOk: keyScore >= 0.5,
         highEnergy: curPunch >= 0.34 && nextPunch >= 0.34,
         hasOutro: cg ? cg.musicalEndSec < current.durationMs / 1000 - 1 : false,
-        eitherChill: curGenre === "chill" || nextGenre === "chill",
-        eitherHiphop: curGenre === "hiphop" || nextGenre === "hiphop",
+        incomingIntroSec: ng?.introSec ?? 0,
         acapellaStemReady,
         stemQualityScore: stemQuality?.score ?? null,
         vocalDensity: stemQuality?.vocalDensity ?? null,
@@ -232,10 +241,10 @@ function planFor(
         case "fade":
             return {
                 type,
-                fadeSec: clampFade(baseFadeSec + (c.eitherChill ? 2 : 0), config),
+                fadeSec: clampFade(baseFadeSec, config),
                 eqSweep: false,
                 tempoRatio: 1,
-                reason: c.eitherChill ? "candidate smooth fade (chill)" : "candidate smooth fade",
+                reason: "candidate smooth fade",
             };
         case "spinback":
             return {
@@ -285,58 +294,60 @@ function candidateTypes(
         types.add("fade");
         return [...types];
     }
-    if (c.eitherChill) {
-        types.add("fade");
-        types.add("echo");
-        types.add("blend");
-        return [...types];
-    }
+    // Genre cannot remove a technically feasible move. It contributes a bounded
+    // preference in scoreType, while these capabilities define the candidate set.
+    types.add("fade");
+    types.add("echo");
     if (c.gap > 0.18) {
         types.add("cut");
         if (c.highEnergy) types.add("spinback");
-        types.add("echo");
-        types.add("fade");
-        return [...types];
-    }
-    if (c.eitherHiphop) {
-        types.add("cut");
-        if (c.highEnergy) {
-            types.add("spinback");
-            types.add("roll");
-        }
-        types.add("filter");
-        return [...types];
-    }
-    if (c.tempoClose && c.keyOk) {
-        types.add("blend");
-        if (c.highEnergy) {
-            types.add("bassdrop");
-            types.add("riser");
-        }
-        if (c.acapellaStemReady && c.keyScore >= 0.7 && c.vocalConflict.safeForAcapella) types.add("acapella");
-        types.add("filter");
-        return [...types];
-    }
-    if (c.tempoClose && !c.keyOk) {
-        types.add("filter");
-        types.add("gate");
-        types.add("echo");
-        types.add("cut");
         return [...types];
     }
     types.add("blend");
-    types.add("cut");
-    types.add("fade");
+    types.add("filter");
+    if (c.highEnergy) {
+        types.add("cut");
+        types.add("gate");
+    }
+    if (c.tempoClose && c.keyOk) {
+        if (c.highEnergy) {
+            types.add("bassdrop");
+            types.add("riser");
+            types.add("spinback");
+            types.add("roll");
+        }
+        if (c.acapellaStemReady && c.keyScore >= 0.7 && c.vocalConflict.safeForAcapella) types.add("acapella");
+    }
     return [...types];
 }
 
-function scoreType(type: TransitionType, c: CandidateContext): { score: number; reasons: string[] } {
+function emptySignals(genre: GenreTransitionSignal): TransitionSignalScores {
+    return {
+        tempo: 0,
+        beat: 0,
+        downbeat: 0,
+        phrase: 0,
+        key: 0,
+        vocals: 0,
+        structure: 0,
+        energy: 0,
+        genre: genre.score,
+        genreWeight: genre.weight,
+        genreContribution: genre.contribution,
+    };
+}
+
+function scoreType(
+    type: TransitionType,
+    c: CandidateContext,
+): { score: number; reasons: string[]; signals: TransitionSignalScores } {
+    const genre = genreTransitionSignal(c.currentGenreEvidence, c.nextGenreEvidence, type);
     if (type === "acapella" && (!c.acapellaStemReady || c.keyScore < 0.7 || !c.vocalConflict.safeForAcapella)) {
-        return { score: -Infinity, reasons: ["acapella not feasible"] };
+        return { score: -Infinity, reasons: ["acapella not feasible"], signals: emptySignals(genre) };
     }
 
     let tempo = 72;
-    if (HARD_TYPES.has(type)) tempo = c.gap > 0.18 || c.eitherHiphop ? 92 : 70;
+    if (HARD_TYPES.has(type)) tempo = c.gap > 0.18 ? 94 : 55;
     else if (type === "fade" || type === "echo") tempo = 78;
     else tempo = c.tempoClose ? 94 : c.gap <= 0.12 ? 72 : 40;
 
@@ -345,26 +356,63 @@ function scoreType(type: TransitionType, c: CandidateContext): { score: number; 
     else if (KEY_MASK_TYPES.has(type)) key = c.keyOk ? 88 : 84;
     else key = c.keyScore * 100;
 
-    let genre = 72;
-    if (c.eitherChill) genre = type === "fade" || type === "echo" ? 96 : HARD_TYPES.has(type) ? 38 : 68;
-    else if (c.eitherHiphop) genre = HARD_TYPES.has(type) ? 94 : type === "filter" ? 76 : 62;
-    else if (["blend", "bassdrop", "riser", "filter", "gate", "acapella"].includes(type)) genre = 86;
-
     let energy = 74;
     if (c.highEnergy)
         energy = ["bassdrop", "riser", "gate", "spinback", "roll"].includes(type) ? 94 : type === "fade" ? 50 : 78;
     else energy = type === "fade" || type === "echo" ? 86 : ["bassdrop", "riser", "spinback"].includes(type) ? 58 : 74;
 
     const stem = type === "acapella" ? (c.stemQualityScore ?? 78) : 72;
-    const vocalLane = type === "acapella" ? c.vocalConflict.score : 72;
+    const vocals = type === "acapella" ? c.vocalConflict.score : 100 - c.vocalConflict.risk * 45;
+    const beat = clamp(c.tempoRelationship.plausibility * 100, 30, 100);
+    const downbeat = clamp(48 + beat * 0.28 + (c.highEnergy ? 18 : 8), 0, 100);
+    const exposedOverlap = ["blend", "acapella"].includes(type);
+    const incomingEntrySpace = c.incomingIntroSec >= 2;
+    const phrase = exposedOverlap && !incomingEntrySpace ? 54 : c.hasOutro ? 88 : c.tempoClose ? 74 : 58;
+    const structure = exposedOverlap
+        ? c.hasOutro && incomingEntrySpace
+            ? 90
+            : incomingEntrySpace
+              ? 68
+              : 28
+        : c.hasOutro
+          ? 90
+          : 62;
+    // Genre is exactly ten percent. Every other point comes from measured musical,
+    // structural or execution-relevant evidence.
     const score =
-        type === "acapella"
-            ? tempo * 0.18 + key * 0.2 + genre * 0.13 + energy * 0.11 + stem * 0.2 + vocalLane * 0.18
-            : tempo * 0.28 + key * 0.24 + genre * 0.25 + energy * 0.23;
-    const reasons = [`tempo ${round(tempo)}`, `key ${round(key)}`, `genre ${round(genre)}`, `energy ${round(energy)}`];
-    if (type === "acapella") reasons.push(`stem ${round(stem)}`);
-    if (type === "acapella") reasons.push(`vocal lane ${round(vocalLane)}`);
-    return { score: round(score), reasons };
+        tempo * 0.2 +
+        key * 0.16 +
+        energy * 0.14 +
+        beat * 0.1 +
+        downbeat * 0.08 +
+        phrase * 0.08 +
+        vocals * 0.08 +
+        structure * 0.06 +
+        genre.score * genre.weight +
+        (type === "acapella" ? (stem - 72) * 0.15 : 0);
+    const signals: TransitionSignalScores = {
+        tempo: round(tempo),
+        beat: round(beat),
+        downbeat: round(downbeat),
+        phrase: round(phrase),
+        key: round(key),
+        vocals: round(vocals),
+        structure: round(structure),
+        energy: round(energy),
+        genre: genre.score,
+        genreWeight: genre.weight,
+        genreContribution: genre.contribution,
+    };
+    const reasons = [
+        `tempo ${round(tempo)} (${c.tempoRelationship.label}, plausibility ${c.tempoRelationship.plausibility.toFixed(2)})`,
+        `key ${round(key)}`,
+        genre.reason,
+        `energy ${round(energy)}`,
+        `beat ${round(beat)}, downbeat ${round(downbeat)}, phrase ${round(phrase)}, structure ${round(structure)}`,
+        `vocals ${round(vocals)}`,
+    ];
+    if (type === "acapella") reasons.push(`stem ${round(stem)}`, ...c.vocalConflict.reasons);
+    return { score: round(score), reasons, signals };
 }
 
 function bucketStats(records: TransitionTelemetryRecord[], minRecords: number): TransitionFeedbackBucket {
@@ -461,13 +509,14 @@ export function buildTransitionCandidates(
             const plan = type === base.type ? base : planFor(type, baseFadeSec, config, c);
             const musical = scoreType(type, c);
             const feedback = feedbackBias(type, c, plan, config.feedback);
-            const baseBonus = type === base.type ? 8 : 0;
+            const baseBonus = type === base.type ? 3 : 0;
             return {
                 plan,
                 score: round(musical.score + feedback + baseBonus),
                 musicalScore: musical.score,
                 feedbackBias: feedback,
                 reasons: musical.reasons,
+                signals: musical.signals,
             };
         })
         .filter((candidate) => Number.isFinite(candidate.score))

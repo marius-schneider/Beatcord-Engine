@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
-
+import { decideAdaptiveStretch } from "./adaptive-stretch";
 import { buildOfflineTransitionRender, OFFLINE_TRANSITIONS } from "./offline-renderer";
+import type { TrackProfile } from "./track-profile";
 
 function plan(extra: Partial<Parameters<typeof buildOfflineTransitionRender>[0]> = {}) {
     return buildOfflineTransitionRender({
@@ -63,4 +64,23 @@ test("buildOfflineTransitionRender supports independent A/B source filters and t
     expect(p.filterComplex).toContain("[1:a]bass=g=1:f=90,rubberband=tempo=1.0400");
     expect(p.commandPreview).toContain("-t 6.86");
     expect(p.commandPreview).toContain("-t 8.32");
+});
+
+test("buildOfflineTransitionRender compiles material-specific stretch tuning", () => {
+    const decision = decideAdaptiveStretch(
+        {
+            vocalness: 0.85,
+            danceability: 0.4,
+            intensity: 0.55,
+            energy: 0.6,
+            acousticness: 0.2,
+            complexity: 0.5,
+            dynamicRange: 8,
+            confidence: { overall: 0.9, structure: 0.8 },
+        } as TrackProfile,
+        0.96,
+    );
+    const rendered = plan({ tempoRatio: decision.appliedRatio, bStretchTuning: decision.tuning });
+    expect(rendered.filterComplex).toContain("transients=mixed");
+    expect(rendered.filterComplex).toContain("formant=preserved");
 });

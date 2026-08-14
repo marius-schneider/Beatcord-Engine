@@ -49,11 +49,11 @@ test("two close-tempo, in-key, punchy tracks → beatmatched blend (or its high-
     expect(plan.eqSweep).toBe(true);
 });
 
-test("stems ready + in-key, close tempo → acapella move (A's vocal over B's beat)", () => {
+test("unscored stems are never trusted blindly for an acapella move", () => {
     const cur = track("Track A", grid(128, "8A", 0.7));
     const next = track("Track B", grid(128, "8A", 0.7)); // same key = keyScore 1.0
     const plan = planTransition(cur, next, 6, { maxFadeSec: 12, tempoTolerance: 0.08, stemsReady: true });
-    expect(plan.type).toBe("acapella");
+    expect(plan.type).not.toBe("acapella");
 });
 
 test("stems ready but poor vocal stem quality → NOT acapella", () => {
@@ -186,8 +186,8 @@ test("hip-hop punchy tracks → cut (or its high-energy spinback variant)", () =
 });
 
 test("punchy tracks with a wide tempo gap → cut (or spinback; can't blend)", () => {
-    const cur = track("Fast One", grid(150, "8A", 0.7));
-    const next = track("Slow One", grid(100, "8A", 0.7)); // gap > 18% after folding
+    const cur = track("Fast One", grid(128, "8A", 0.7));
+    const next = track("Slow One", grid(100, "8A", 0.7)); // no plausible 1×, 2×, or 3:2 fold
     const plan = planTransition(cur, next, 6);
     expect(["cut", "spinback"]).toContain(plan.type);
 });
@@ -208,8 +208,23 @@ test("fade length never exceeds maxFadeSec", () => {
 
 test("missing grids → safe default blend", () => {
     const plan = planTransition(track("A", null), track("B", null), 6);
-    expect(["blend", "fade"]).toContain(plan.type);
+    expect(plan.type).toBe("blend");
     expect(plan.fadeSec).toBeGreaterThan(0);
+});
+
+test("genre metadata alone cannot force a chill fade", () => {
+    const cur = track("Chill House Session", grid(126, "8A", 0.72));
+    const next = track("Chill House Anthem", grid(127, "9A", 0.7));
+    const plan = planTransition(cur, next, 6);
+    expect(plan.type).not.toBe("fade");
+    expect(["blend", "bassdrop", "riser"]).toContain(plan.type);
+});
+
+test("genre metadata alone cannot force a hip-hop cut", () => {
+    const cur = track("Soft Trap Lullaby", grid(82, "8A", 0.15));
+    const next = track("Quiet Hip Hop Interlude", grid(83, "9A", 0.16));
+    const plan = planTransition(cur, next, 6);
+    expect(["cut", "spinback", "roll"]).not.toContain(plan.type);
 });
 
 test("tempoMatchRatio folds half/double-time and respects tolerance", () => {
@@ -217,6 +232,17 @@ test("tempoMatchRatio folds half/double-time and respects tolerance", () => {
     expect(tempoMatchRatio(128, 64)).toBeCloseTo(1); // double-time → match
     expect(tempoMatchRatio(128, 100)).toBe(1); // 28% gap → no stretch
     expect(tempoMatchRatio(128, 124)).toBeGreaterThan(1); // within tolerance → stretch
+    expect(tempoMatchRatio(100, 150)).toBeCloseTo(1); // 3:2 pulse relation
+    expect(tempoMatchRatio(150, 100)).toBeCloseTo(1); // inverse 2:3 relation
+});
+
+test("punchy 100/150 BPM tracks can blend through a plausible 3:2 pulse", () => {
+    const cur = track("House Pulse", grid(100, "8A", 0.7));
+    const next = track("Fast House Pulse", grid(150, "8A", 0.7));
+    const plan = planTransition(cur, next, 6);
+    expect(["blend", "bassdrop", "riser"]).toContain(plan.type);
+    expect(plan.reason).toContain("3:2 pulse");
+    expect(plan.tempoRatio).toBeCloseTo(1);
 });
 
 test("audio-only classification steers a dark sustained track to a chill move (fade/echo)", () => {

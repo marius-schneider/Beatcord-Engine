@@ -4,12 +4,18 @@ import { resolve } from "node:path";
 // @ts-expect-error - music-tempo ships no types
 import MusicTempo from "music-tempo";
 
+import {
+    type ConfidenceEvidence,
+    type ConfidenceFusion,
+    fuseCategoricalEvidence,
+    fuseNumericEvidence,
+} from "./confidence-fusion";
 import { config } from "./config";
 import { detectDanceability } from "./descriptors";
 import { analyseSpectrum, type KeyInfo, type SpectralFeatures } from "./key";
 import { detectKeyEssentia } from "./key-essentia";
 import { createLogger } from "./logger";
-import { spectralFeatures } from "./spectral";
+import { limitFor, resources } from "./resources";
 import { detectTempoAubio } from "./tempo";
 
 const log = createLogger("BeatGrid");
@@ -25,7 +31,7 @@ const ffmpegPath = resolve(process.cwd(), config.FFMPEG_PATH);
 // identical, only the threading differs.
 
 /** How many analyses can run at once (cap CPU on a busy server). */
-const POOL_SIZE = 2;
+const POOL_SIZE = limitFor(config.BEATGRID_WORKERS, resources.beatgridWorkers);
 
 interface PoolWorker {
     worker: Worker;
@@ -88,6 +94,55 @@ function pumpQueue(): void {
  * so the audio stream + voice commands stay smooth; on a host without Workers it
  * runs synchronously (same result). Returns null when the track can't be analysed.
  */
+/**
+ * Snap a detected grid to a TRUSTED BPM hint (e.g. TIDAL's) when the detector
+ * landed a clean octave off (half/double-time). Octave errors are the #1 cause
+ * of a beatmatched blend collapsing into a hard cut: one track detected at 64,
+ * its neighbour at 128, the planner sees a huge tempo gap → cut. TIDAL gives us
+ * the real BPM for free (lossless metadata), so we fix the octave here.
+ *
+ * ONLY clean octaves (≈½ or ≈2×) are corrected — a genuine tempo disagreement is
+ * left alone (we trust neither source). phrase-cues reads only `beatInterval`,
+ * `beats[0]` (phase anchor) and `downbeatPhase`, so rescaling those three keeps
+ * beat-alignment correct without regenerating the beats array. Pure + testable.
+ */
+export function reconcileTempo(grid: BeatGrid, hintBpm: number | null | undefined): BeatGrid {
+    if (!hintBpm || hintBpm < 40 || hintBpm > 260 || grid.bpm <= 0) return grid;
+    const ratio = hintBpm / grid.bpm;
+    let factor = 1;
+    if (ratio > 1.75 && ratio < 2.25)
+        factor = 2; // detector caught half-time → double it
+    else if (ratio > 0.44 && ratio < 0.57) factor = 0.5; // detector caught double-time → halve it
+    const bpm = Math.round(grid.bpm * factor * 10) / 10;
+    const downbeatPhase =
+        factor === 1
+            ? grid.downbeatPhase
+            : factor === 2
+              ? (grid.downbeatPhase * 2) % 4
+              : Math.floor(grid.downbeatPhase / 2);
+    const detectorEvidence: ConfidenceEvidence<number>[] = grid.analysisConfidence?.tempo.evidence.length
+        ? grid.analysisConfidence.tempo.evidence.map((item) => ({ ...item, value: item.value * factor }))
+        : [{ source: "audio-analysis", value: bpm, confidence: 0.65 }];
+    const tempo = fuseNumericEvidence(
+        [...detectorEvidence, { source: "metadata", family: "metadata", value: hintBpm, confidence: 0.72 }],
+        { tolerance: 0.025, relative: true, precision: 1 },
+    );
+    return {
+        ...grid,
+        bpm,
+        beatInterval: grid.beatInterval / factor,
+        downbeatPhase,
+        analysisConfidence: {
+            ...(grid.analysisConfidence ?? {
+                key: fuseCategoricalEvidence([
+                    { source: "legacy-key", value: grid.key.camelot, confidence: Math.max(0, grid.key.confidence) },
+                ]),
+            }),
+            tempo,
+        },
+    };
+}
+
 export function detectBeatGrid(filePath: string, durationMs: number): Promise<BeatGrid | null> {
     const p = initPool();
     if (!p) return detectBeatGridSync(filePath, durationMs); // no workers → inline
@@ -122,6 +177,11 @@ export interface BeatGrid {
     musicalEndSec: number;
     /** Detected musical key + Camelot code, for harmonic mixing. */
     key: KeyInfo;
+    /** Multi-analyzer agreement/conflict retained for director-level policy. */
+    analysisConfidence?: {
+        tempo: ConfidenceFusion<number>;
+        key: ConfidenceFusion<string>;
+    };
     /** Loudness + percussiveness signals, for choosing the transition style. */
     energy: EnergyInfo;
     /** Spectral timbre features (brightness/noisiness/flux) for genre detection. */
@@ -327,8 +387,24 @@ export async function detectBeatGridSync(filePath: string, durationMs: number): 
         // into the usual musical range. Either way the value is folded to 70–140 so
         // tempo-sync compares like for like; beat positions are untouched.
         const aubio = await detectTempoAubio(samples, 44_100);
-        const rawBpm = aubio && aubio.confidence >= 0.1 ? aubio.bpm : 60 / interval;
-        const bpm = normaliseBpm(rawBpm);
+        const tempoEvidence: ConfidenceEvidence<number>[] = [
+            {
+                source: "music-tempo",
+                family: "beatroot",
+                value: normaliseBpm(mtBpm),
+                confidence: beatEvidenceConfidence(beats, interval),
+            },
+        ];
+        if (aubio && aubio.confidence >= 0.1) {
+            tempoEvidence.push({
+                source: "aubio",
+                family: "aubio",
+                value: normaliseBpm(aubio.bpm),
+                confidence: aubio.confidence,
+            });
+        }
+        const tempo = fuseNumericEvidence(tempoEvidence, { tolerance: 0.025, relative: true, precision: 1 });
+        const bpm = tempo.value ?? normaliseBpm(60 / interval);
 
         // These two scans were kicked off in parallel with the beat-window decode
         // above (outro = where the music ends; intro = until the beat kicks in);
@@ -340,10 +416,30 @@ export async function detectBeatGridSync(filePath: string, durationMs: number): 
         // 43 tracks exposed an A-minor bias in our local Krumhansl detector). When
         // WASM is unavailable, fall back to the local combined pass — with essentia
         // we only need the spectral half (genre timbre) computed locally.
+        const localAnalysis = analyseSpectrum(samples, 44_100);
         const essKey = await detectKeyEssentia(samples);
-        const { key, spectral } = essKey
-            ? { key: essKey, spectral: spectralFeatures(samples, 44_100) }
-            : analyseSpectrum(samples, 44_100);
+        const keyEvidence = [
+            {
+                source: "local-chroma",
+                family: "local-chroma",
+                value: localAnalysis.key.camelot,
+                confidence: Math.max(0, Math.min(1, (localAnalysis.key.confidence + 1) / 2)),
+            },
+            ...(essKey
+                ? [
+                      {
+                          source: "essentia",
+                          family: "essentia",
+                          value: essKey.camelot,
+                          confidence: essKey.confidence,
+                      },
+                  ]
+                : []),
+        ];
+        const keyFusion = fuseCategoricalEvidence(keyEvidence);
+        const selectedKey = essKey?.camelot === keyFusion.value ? essKey : localAnalysis.key;
+        const key = { ...selectedKey, confidence: keyFusion.confidence };
+        const spectral = localAnalysis.spectral;
         // Energy + percussiveness for transition-style selection (same samples).
         const energy = computeEnergy(samples, 44_100);
         // Danceability (essentia, same samples — no extra ffmpeg pass). The analysed
@@ -366,6 +462,7 @@ export async function detectBeatGridSync(filePath: string, durationMs: number): 
             beatInterval: interval,
             analysisOffset: offset,
             key,
+            analysisConfidence: { tempo, key: keyFusion },
             energy,
             spectral,
             downbeatPhase,
@@ -390,6 +487,19 @@ function normaliseBpm(bpm: number): number {
     while (b > 140) b /= 2;
     while (b < 70) b *= 2;
     return Math.round(b * 10) / 10;
+}
+
+/** Confidence proxy for MusicTempo based on grid density and interval stability. */
+function beatEvidenceConfidence(beats: number[], interval: number): number {
+    if (beats.length < 4 || interval <= 0) return 0.1;
+    const gaps: number[] = [];
+    for (let index = 1; index < beats.length; index++)
+        gaps.push(Math.abs(beats[index]! - beats[index - 1]! - interval));
+    gaps.sort((a, b) => a - b);
+    const medianDeviation = gaps[Math.floor(gaps.length / 2)] ?? interval;
+    const regularity = Math.max(0, 1 - medianDeviation / Math.max(interval * 0.12, 1e-6));
+    const density = Math.min(1, beats.length / 48);
+    return Math.min(0.92, 0.32 + regularity * 0.42 + density * 0.18);
 }
 
 /** Median gap between consecutive beats — robust tempo basis (ignores outliers). */

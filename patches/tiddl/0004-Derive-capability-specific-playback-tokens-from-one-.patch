@@ -1,0 +1,326 @@
+From 0792035f20f4c06e06bdb9ea58e0c0adac2a50ac Mon Sep 17 00:00:00 2001
+From: Marius Schneider <marius.schnd@icloud.com>
+Date: Thu, 13 Aug 2026 14:57:25 +0200
+Subject: [PATCH 4/5] Derive capability-specific playback tokens from one login
+
+TIDAL grants playback capabilities per client id, not per account: with the
+default client id a HI_RES_LOSSLESS request silently degrades to LOSSLESS even
+on a MAX subscription. Both tokens are derivable from the refresh token of a
+single existing login, so no second login is needed.
+
+Adds ProfileTokenManager (caches per-profile tokens, rotates the refresh token
+when the server hands back a new one), parameterises AuthClient with the client
+id/secret/refresh style each profile needs, and lets TidalClient send the
+matching X-Tidal-Token header.
+
+Verified against a live account: hires -> 24bit/96kHz, default -> 16bit/44.1kHz.
+
+Core subset of PR #427; the CLI-side profile wiring is not used here.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ tiddl/core/api/client.py    |   9 ++-
+ tiddl/core/auth/__init__.py |  13 +++-
+ tiddl/core/auth/api.py      |   6 +-
+ tiddl/core/auth/client.py   |  44 +++++++++----
+ tiddl/core/auth/models.py   |  15 +++++
+ tiddl/core/auth/profiles.py | 123 ++++++++++++++++++++++++++++++++++++
+ 6 files changed, 191 insertions(+), 19 deletions(-)
+ create mode 100644 tiddl/core/auth/profiles.py
+
+diff --git a/tiddl/core/api/client.py b/tiddl/core/api/client.py
+index 75c12f7..d64e930 100644
+--- a/tiddl/core/api/client.py
++++ b/tiddl/core/api/client.py
+@@ -39,16 +39,23 @@ class TidalClient:
+         omit_cache: bool = False,
+         debug_path: Path | None = None,
+         on_token_expiry: Optional[Callable[[], str | None]] = None,
++        client_id: str | None = None,
+     ) -> None:
+         self.on_token_expiry = on_token_expiry
+         self.debug_path = debug_path
+         self.session = CachedSession(
+             cache_name=cache_name, always_revalidate=omit_cache
+         )
+-        self.session.headers = {
++        headers = {
+             "Authorization": f"Bearer {token}",
+             "Accept": "application/json",
+         }
++        if client_id:
++            # The API grants playback capabilities per client id, so a token
++            # derived for a given profile must be presented with it.
++            headers["X-Tidal-Token"] = client_id
++
++        self.session.headers = headers
+         self._token = token
+ 
+     @property
+diff --git a/tiddl/core/auth/__init__.py b/tiddl/core/auth/__init__.py
+index be1101a..0ac7605 100644
+--- a/tiddl/core/auth/__init__.py
++++ b/tiddl/core/auth/__init__.py
+@@ -1,4 +1,15 @@
+ from .api import AuthAPI
+ from .exceptions import AuthClientError
++from .profiles import (
++    PlaybackProfile,
++    ProfileTokenManager,
++    select_playback_profile,
++)
+ 
+-__all__ = ["AuthAPI", "AuthClientError"]
++__all__ = [
++    "AuthAPI",
++    "AuthClientError",
++    "PlaybackProfile",
++    "ProfileTokenManager",
++    "select_playback_profile",
++]
+diff --git a/tiddl/core/auth/api.py b/tiddl/core/auth/api.py
+index fbe2856..5a1e7cd 100644
+--- a/tiddl/core/auth/api.py
++++ b/tiddl/core/auth/api.py
+@@ -1,7 +1,7 @@
+ from tiddl.core.auth.client import AuthClient
+ from tiddl.core.auth.models import (
+     AuthDeviceResponse,
+-    AuthResponse,
++    AuthRefreshResponse,
+     AuthResponseWithRefresh,
+ )
+ 
+@@ -18,9 +18,9 @@ class AuthAPI:
+         json_data = self._client.get_auth(device_code)
+         return AuthResponseWithRefresh.model_validate(json_data)
+ 
+-    def refresh_token(self, refresh_token: str) -> AuthResponse:
++    def refresh_token(self, refresh_token: str) -> AuthRefreshResponse:
+         json_data = self._client.refresh_token(refresh_token)
+-        return AuthResponse.model_validate(json_data)
++        return AuthRefreshResponse.model_validate(json_data)
+ 
+     def logout_token(self, access_token: str) -> None:
+         self._client.logout_token(access_token)
+diff --git a/tiddl/core/auth/client.py b/tiddl/core/auth/client.py
+index 78fddf6..71be150 100644
+--- a/tiddl/core/auth/client.py
++++ b/tiddl/core/auth/client.py
+@@ -38,10 +38,18 @@ JSON: TypeAlias = dict[str, Any]
+ 
+ class AuthClient:
+ 
+-    def __init__(self) -> None:
++    def __init__(
++        self,
++        client_id: str = CLIENT_ID,
++        client_secret: str = CLIENT_SECRET,
++        refresh_with_basic_auth: bool = True,
++        refresh_scope: str = "r_usr+w_usr+w_sub",
++    ) -> None:
+         self.auth_url = AUTH_URL
+-        self.client_id = CLIENT_ID
+-        self.client_secret = CLIENT_SECRET
++        self.client_id = client_id
++        self.client_secret = client_secret
++        self.refresh_with_basic_auth = refresh_with_basic_auth
++        self.refresh_scope = refresh_scope
+ 
+     def get_device_auth(self) -> JSON:
+         res = request(
+@@ -75,17 +83,25 @@ class AuthClient:
+         return json_data
+ 
+     def refresh_token(self, refresh_token: str) -> JSON:
+-        res = request(
+-            "POST",
+-            f"{self.auth_url}/token",
+-            data={
+-                "client_id": self.client_id,
+-                "refresh_token": refresh_token,
+-                "grant_type": "refresh_token",
+-                "scope": "r_usr+w_usr+w_sub",
+-            },
+-            auth=(self.client_id, self.client_secret),
+-        )
++        data = {
++            "client_id": self.client_id,
++            "refresh_token": refresh_token,
++            "grant_type": "refresh_token",
++            "scope": self.refresh_scope,
++        }
++
++        if self.refresh_with_basic_auth:
++            res = request(
++                "POST",
++                f"{self.auth_url}/token",
++                data=data,
++                auth=(self.client_id, self.client_secret),
++            )
++        else:
++            # Some client profiles reject HTTP basic auth and want the secret in
++            # the form body instead.
++            data["client_secret"] = self.client_secret
++            res = request("POST", f"{self.auth_url}/token", data=data)
+ 
+         res.raise_for_status()
+ 
+diff --git a/tiddl/core/auth/models.py b/tiddl/core/auth/models.py
+index 04732df..4d8156e 100644
+--- a/tiddl/core/auth/models.py
++++ b/tiddl/core/auth/models.py
+@@ -43,6 +43,21 @@ class AuthResponseWithRefresh(AuthResponse):
+     refresh_token: str
+ 
+ 
++class AuthRefreshResponse(AuthResponse):
++    """A refresh may or may not rotate the refresh token."""
++
++    refresh_token: str | None = None
++
++
++class AuthTokenResponse(BaseModel):
++    """Minimal token shape — the profile broker talks to client ids whose
++    responses omit the user/scope block AuthResponse requires."""
++
++    access_token: str
++    expires_in: int
++    refresh_token: str | None = None
++
++
+ class AuthDeviceResponse(BaseModel):
+     deviceCode: str
+     userCode: str
+diff --git a/tiddl/core/auth/profiles.py b/tiddl/core/auth/profiles.py
+new file mode 100644
+index 0000000..a7490de
+--- /dev/null
++++ b/tiddl/core/auth/profiles.py
+@@ -0,0 +1,123 @@
++from collections.abc import Callable
++from dataclasses import dataclass
++from threading import Lock
++from time import time
++from typing import Literal
++
++from tiddl.core.auth.client import (
++    CLIENT_ID,
++    CLIENT_SECRET,
++    AuthClient,
++)
++from tiddl.core.auth.models import AuthTokenResponse
++
++PlaybackProfile = Literal["hires", "atmos"]
++
++
++@dataclass(frozen=True)
++class ClientProfile:
++    client_id: str
++    client_secret: str
++    refresh_with_basic_auth: bool
++
++
++@dataclass(frozen=True)
++class ProfileToken:
++    access_token: str
++    client_id: str
++    expires_at: float
++
++
++# TIDAL exposes different playback capabilities to different client profiles.
++# Both access tokens can be derived from the refresh token created by one login.
++PLAYBACK_SCOPE = "r_usr+w_usr"
++CLIENT_PROFILES: dict[PlaybackProfile, ClientProfile] = {
++    "hires": ClientProfile(
++        client_id="6BDSRdpK9hqEBTgU",
++        client_secret="xeuPmY7nbpZ9IIbLAcQ93shka1VNheUAqN6IcszjTG8=",
++        refresh_with_basic_auth=False,
++    ),
++    "atmos": ClientProfile(
++        client_id=CLIENT_ID,
++        client_secret=CLIENT_SECRET,
++        refresh_with_basic_auth=True,
++    ),
++}
++
++
++def select_playback_profile(
++    atmos_filter: Literal["none", "only", "allow"],
++    atmos_available: bool,
++) -> PlaybackProfile:
++    if atmos_filter == "none":
++        return "hires"
++
++    if atmos_filter == "only" or atmos_available:
++        return "atmos"
++
++    return "hires"
++
++
++class ProfileTokenManager:
++    """Derive and cache capability-specific access tokens from one login."""
++
++    def __init__(
++        self,
++        refresh_token: str,
++        on_refresh_token: Callable[[str], None] | None = None,
++        clock: Callable[[], float] = time,
++        expiry_margin: int = 60,
++        client_factory: Callable[[ClientProfile], AuthClient] | None = None,
++    ) -> None:
++        self._refresh_token = refresh_token
++        self._on_refresh_token = on_refresh_token
++        self._clock = clock
++        self._expiry_margin = expiry_margin
++        self._client_factory = client_factory or self._create_client
++        self._tokens: dict[PlaybackProfile, ProfileToken] = {}
++        self._lock = Lock()
++
++    @staticmethod
++    def _create_client(profile: ClientProfile) -> AuthClient:
++        return AuthClient(
++            client_id=profile.client_id,
++            client_secret=profile.client_secret,
++            refresh_with_basic_auth=profile.refresh_with_basic_auth,
++            refresh_scope=PLAYBACK_SCOPE,
++        )
++
++    def get_token(
++        self, profile_name: PlaybackProfile, force: bool = False
++    ) -> ProfileToken:
++        with self._lock:
++            cached_token = self._tokens.get(profile_name)
++            if (
++                not force
++                and cached_token
++                and cached_token.expires_at > self._clock() + self._expiry_margin
++            ):
++                return cached_token
++
++            profile = CLIENT_PROFILES[profile_name]
++            client = self._client_factory(profile)
++            response = AuthTokenResponse.model_validate(
++                client.refresh_token(self._refresh_token)
++            )
++
++            if response.refresh_token and response.refresh_token != self._refresh_token:
++                self._refresh_token = response.refresh_token
++                if self._on_refresh_token:
++                    self._on_refresh_token(response.refresh_token)
++
++            token = ProfileToken(
++                access_token=response.access_token,
++                client_id=profile.client_id,
++                expires_at=self._clock() + response.expires_in,
++            )
++            self._tokens[profile_name] = token
++            return token
++
++    def replace_refresh_token(self, refresh_token: str) -> None:
++        """Keep the broker synchronized if another API refresh rotates the token."""
++        with self._lock:
++            self._refresh_token = refresh_token
+-- 
+2.55.0
+
